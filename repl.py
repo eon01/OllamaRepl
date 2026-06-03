@@ -1,29 +1,27 @@
-# repl.py (pass 3: streaming + multi-line input)
-"""A chat REPL with streaming output and multi-line input.
+# repl.py (pass 5: real summarization via LangChain)
+"""A chat REPL that compresses old conversation history instead of dropping it.
 
-Multi-line input: type your message across as many lines as you like,
-then send it by hitting Enter on an empty line. Type /bye on its own
-line to exit.
+We keep pass 4's trim_history function as a fallback layer below the
+middleware, but in practice SummarizationMiddleware does the heavy
+lifting: it intercepts every model call, counts tokens across the
+conversation, and when the total crosses our trigger threshold it
+asks the model itself to summarize the older messages.
 """
 
-from ollama import Client
+from langchain.agents import create_agent
+from langchain.agents.middleware import SummarizationMiddleware
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_ollama import ChatOllama
+
 from config import OLLAMA_HOST, OLLAMA_MODEL
 
 
 def read_input() -> str:
-    """Read lines from stdin until the user submits an empty line.
-
-    The first line uses a '> ' prompt, continuation lines use '  ' so
-    the user can see they're still inside the same message. Returns the
-    joined message with newlines preserved.
-    """
+    """Read lines from stdin until the user submits an empty line."""
     lines: list[str] = []
     prompt = "> "
     while True:
         line = input(prompt)
-        # Empty line means "I'm done, send it". This applies even on the
-        # first line: hitting Enter immediately just gives an empty turn,
-        # which the caller can ignore.
         if line == "":
             break
         lines.append(line)
@@ -32,44 +30,68 @@ def read_input() -> str:
 
 
 def main() -> None:
-    # We bump the client timeout because long replies can easily exceed
-    # the default. Setting it to None disables the timeout entirely; we
-    # use a generous number instead so a truly stuck server still fails.
-    client = Client(host=OLLAMA_HOST, timeout=300)
+    llm = ChatOllama(
+        model=OLLAMA_MODEL,
+        base_url=OLLAMA_HOST,
+        num_predict=512,
+    )
 
-    print(f"Chatting with {OLLAMA_MODEL}.")
+    # The "summarizer" model. In production setups people often pick a
+    # smaller or faster model here, since summarization is a simpler task
+    summarizer = ChatOllama(
+        model=OLLAMA_MODEL,
+        base_url=OLLAMA_HOST,
+        num_predict=512,
+    )
+
+    # create_agent builds an executable agent around the worker model.
+    # The middleware list runs in order; ours has just one entry, which
+    # fires before each model call and decides whether to summarize.
+    #
+    # trigger=("tokens", 2000) means: if the conversation reaches 2000
+    # tokens, summarize older messages before the next call.
+
+    # keep=("messages", 6) means: preserve the most recent 6 messages
+    # verbatim. Everything older becomes a summary.
+    agent = create_agent(
+        model=llm,
+        tools=[],
+        middleware=[
+            SummarizationMiddleware(
+                model=summarizer,
+                trigger=("tokens", 2000),
+                keep=("messages", 6),
+            ),
+        ],
+    )
+
+    print(f"Chatting with {OLLAMA_MODEL} (with summarization).")
     print("Hit Enter on an empty line to send. Type /bye to exit.")
 
-    messages: list[dict] = []
+    messages: list = []
 
     while True:
         user = read_input()
-
-        # Skip empty submissions instead of sending an empty turn to the
-        # model, which wastes a round trip and confuses some models.
         if user == "":
             continue
         if user.strip() == "/bye":
             break
 
-        messages.append({"role": "user", "content": user})
+        messages.append(HumanMessage(content=user))
 
-        # stream=True returns an iterator of ChatResponse chunks. Each
-        # chunk has a small piece of text in chunk.message.content. We
-        # print it immediately and also accumulate it so we have the
-        # complete reply to append to history when the stream ends.
+        # stream_mode="messages" yields (chunk, metadata) tuples where
+        # chunk.content is just the new tokens, not the cumulative reply.
         full_reply = ""
-        for chunk in client.chat(model=OLLAMA_MODEL, messages=messages, stream=True):
-            piece = chunk.message.content
-            print(piece, end="", flush=True)
-            full_reply += piece
+        for chunk, _ in agent.stream(
+            {"messages": messages},
+            stream_mode="messages",
+        ):
+            if isinstance(chunk, AIMessage) and chunk.content:
+                print(chunk.content, end="", flush=True)
+                full_reply += chunk.content
 
-        # Print a final newline so the next "> " prompt starts on its
-        # own line. Without this the prompt would butt up against the
-        # last character of the reply.
         print()
-
-        messages.append({"role": "assistant", "content": full_reply})
+        messages.append(AIMessage(content=full_reply))
 
 
 if __name__ == "__main__":
